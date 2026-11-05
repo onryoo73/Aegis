@@ -51,6 +51,13 @@ type DashboardData = {
   fetchedAt: Date;
 };
 
+type IncidentReport = {
+  origin?: Hash;
+  guard?: Hash;
+  callback?: Hash;
+  breaker?: Hash;
+};
+
 const addresses = {
   vault: (import.meta.env.VITE_ORIGIN_VAULT ?? "") as Address,
   guard: (import.meta.env.VITE_GUARD_ADDRESS ?? "") as Address,
@@ -112,6 +119,53 @@ const breakerAbi = [
   { name: "lastBreachId", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "bytes32" }] },
 ] as const;
 
+const originBreachEvent = {
+  type: "event",
+  name: "InvariantBreached",
+  inputs: [
+    { name: "reserves", type: "uint256", indexed: false },
+    { name: "liabilities", type: "uint256", indexed: false },
+    { name: "healthBps", type: "uint256", indexed: false },
+    { name: "thresholdBps", type: "uint256", indexed: false },
+  ],
+} as const;
+const guardBreachEvent = {
+  type: "event",
+  name: "BreachConfirmed",
+  inputs: [
+    { name: "breachId", type: "bytes32", indexed: true },
+    { name: "healthBps", type: "uint256", indexed: false },
+    { name: "reserves", type: "uint256", indexed: false },
+    { name: "liabilities", type: "uint256", indexed: false },
+    { name: "originBlockNumber", type: "uint256", indexed: false },
+    { name: "originTxHash", type: "uint256", indexed: false },
+  ],
+} as const;
+const callbackRequestEvent = {
+  type: "event",
+  name: "CallbackRequested",
+  inputs: [
+    { name: "breachId", type: "bytes32", indexed: true },
+    { name: "destinationChainId", type: "uint256", indexed: true },
+    { name: "recipient", type: "address", indexed: true },
+    { name: "gasLimit", type: "uint64", indexed: false },
+  ],
+} as const;
+const breakerEvent = {
+  type: "event",
+  name: "CircuitBreakerTriggered",
+  inputs: [
+    { name: "breachId", type: "bytes32", indexed: true },
+    { name: "guard", type: "address", indexed: true },
+    { name: "healthBps", type: "uint256", indexed: false },
+    { name: "reserves", type: "uint256", indexed: false },
+    { name: "liabilities", type: "uint256", indexed: false },
+    { name: "originChainId", type: "uint256", indexed: false },
+    { name: "frozenLtvBps", type: "uint256", indexed: false },
+    { name: "timestamp", type: "uint256", indexed: false },
+  ],
+} as const;
+
 const vaultWriteAbi = [
   { name: "deposit", type: "function", stateMutability: "payable", inputs: [], outputs: [] },
   { name: "recordLoss", type: "function", stateMutability: "nonpayable", inputs: [{ name: "amount", type: "uint256" }], outputs: [] },
@@ -140,6 +194,7 @@ const formatNumber = (value: bigint) => new Intl.NumberFormat("en-US").format(Nu
 const formatDate = (value: bigint) =>
   value === 0n ? "—" : new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" }).format(Number(value) * 1000);
 const explorerAddress = (chain: ChainConfig, address: string) => `${chain.explorer}/address/${address}`;
+const explorerTransaction = (chain: ChainConfig, hash: Hash) => `${chain.explorer}/tx/${hash}`;
 
 async function readDashboard(): Promise<DashboardData> {
   const vaultReads = ["healthBps", "minCoverageBps", "reserves", "totalDeposits", "breached"] as const;
@@ -170,6 +225,35 @@ async function readDashboard(): Promise<DashboardData> {
   };
 }
 
+async function readIncidentReport(): Promise<IncidentReport> {
+  const latestBlocks = await Promise.all(chains.map(async (chain) => [chain.key, await clients[chain.key].getBlockNumber()] as const));
+  const blockMap = Object.fromEntries(latestBlocks) as Record<ChainKey, bigint>;
+  const fromBlock = (block: bigint, maxRange: bigint) => block > maxRange ? block - maxRange : 0n;
+  const latest = <T extends { blockNumber: bigint | null }>(logs: readonly T[]) =>
+    [...logs].sort((a, b) => Number((b.blockNumber ?? 0n) - (a.blockNumber ?? 0n)))[0];
+  const [originLogs, breakerLogs] = await Promise.all([
+    clients.base.getLogs({ address: addresses.vault, event: originBreachEvent, fromBlock: fromBlock(blockMap.base, 200n), toBlock: blockMap.base }),
+    clients.unichain.getLogs({ address: addresses.breaker, event: breakerEvent, fromBlock: fromBlock(blockMap.unichain, 1_000n), toBlock: blockMap.unichain }),
+  ]);
+  const breaker = latest(breakerLogs);
+  const breachId = breaker?.args.breachId;
+  const [guardLogs, callbackLogs] = await Promise.all([
+    clients.lasna.getLogs({ address: addresses.guard, event: guardBreachEvent, args: breachId ? { breachId } : undefined, fromBlock: fromBlock(blockMap.lasna, 1_000n), toBlock: blockMap.lasna }),
+    clients.lasna.getLogs({ address: addresses.guard, event: callbackRequestEvent, args: breachId ? { breachId } : undefined, fromBlock: fromBlock(blockMap.lasna, 1_000n), toBlock: blockMap.lasna }),
+  ]);
+  const guard = latest(guardLogs);
+  const callback = latest(callbackLogs);
+  const origin = guard?.args.originTxHash
+    ? originLogs.find((log) => log.transactionHash && BigInt(log.transactionHash) === guard.args.originTxHash)
+    : latest(originLogs);
+  return {
+    origin: origin?.transactionHash,
+    guard: guard?.transactionHash,
+    callback: callback?.transactionHash,
+    breaker: breaker?.transactionHash,
+  };
+}
+
 function Icon({ name }: { name: "shield" | "activity" | "arrow" | "external" | "refresh" | "lock" }) {
   const paths = {
     shield: <><path d="M12 3 4.7 6.1v5.1c0 4.5 3 7.3 7.3 8.8 4.3-1.5 7.3-4.3 7.3-8.8V6.1L12 3Z" /><path d="m8.6 12 2.2 2.2 4.7-5" /></>,
@@ -184,6 +268,7 @@ function Icon({ name }: { name: "shield" | "activity" | "arrow" | "external" | "
 
 function App() {
   const [data, setData] = useState<DashboardData>();
+  const [incidentReport, setIncidentReport] = useState<IncidentReport>();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [walletAddress, setWalletAddress] = useState<Address>();
@@ -198,7 +283,9 @@ function App() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await readDashboard());
+      const [dashboard, report] = await Promise.all([readDashboard(), readIncidentReport()]);
+      setData(dashboard);
+      setIncidentReport(report);
       setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unable to read the live protocol state.");
@@ -435,6 +522,29 @@ function App() {
           <div className="snapshot-grid"><div><span>Frozen LTV</span><strong>{data ? percentage(data.breaker.frozenLtv) : "—"}</strong></div><div><span>Incidents</span><strong>{data ? formatNumber(data.breaker.breachCount) : "—"}</strong></div><div><span>Paused since</span><strong>{data ? formatDate(data.breaker.pausedAt) : "—"}</strong></div><div><span>Last breach</span><strong className="mono">{data ? shortHash(data.breaker.lastBreachId) : "—"}</strong></div></div>
           <div className="protection-note"><Icon name="shield" /><div><strong>{incident ? "Protection is holding" : "Protection is armed"}</strong><p>{incident ? "All destination-side credit and redemption paths are frozen until an owner reviews the incident." : "The breaker is ready to contain a verified breach."}</p></div></div>
         </article>
+      </section>
+
+      <section className="panel incident-report">
+        <div className="panel-header">
+          <div><p className="eyebrow">VERIFIABLE INCIDENT REPORT</p><h2>Proof of response</h2></div>
+          <span className="report-caption">Latest matching on-chain evidence</span>
+        </div>
+        <div className="report-list">
+          {([
+            ["01", "Breach emitted", "Origin vault · Base Sepolia", incidentReport?.origin, chains[0]],
+            ["02", "Invariant verified", "Reactive guard · Lasna", incidentReport?.guard, chains[1]],
+            ["03", "Callback requested", "Reactive system · Lasna", incidentReport?.callback, chains[1]],
+            ["04", "Circuit breaker triggered", "Destination breaker · Unichain", incidentReport?.breaker, chains[2]],
+          ] as const).map(([number, label, detail, hash, chain]) => (
+            <div className={`report-row ${hash ? "reported" : ""}`} key={label}>
+              <span className="report-number">{number}</span>
+              <span className="report-marker" style={{ background: chain.accent, boxShadow: `0 0 12px ${chain.accent}` }} />
+              <div className="report-copy"><strong>{label}</strong><small>{detail}</small></div>
+              {hash ? <a className="report-hash" href={explorerTransaction(chain, hash)} target="_blank" rel="noreferrer" title={hash}>{shortHash(hash)} <Icon name="external" /></a> : <span className="report-pending">Waiting for event…</span>}
+            </div>
+          ))}
+        </div>
+        <div className="report-footer"><span><i className="legend-dot green" /> Hashes are read from contract event logs</span><span>Open any hash to verify independently ↗</span></div>
       </section>
 
       <section className="demo-console">
