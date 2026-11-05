@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   createPublicClient,
+  createWalletClient,
+  custom,
+  defineChain,
   formatEther,
-  formatUnits,
   http,
+  parseEther,
   type Address,
+  type Hash,
   type PublicClient,
 } from "viem";
 
@@ -108,6 +112,20 @@ const breakerAbi = [
   { name: "lastBreachId", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "bytes32" }] },
 ] as const;
 
+const vaultWriteAbi = [
+  { name: "deposit", type: "function", stateMutability: "payable", inputs: [], outputs: [] },
+  { name: "recordLoss", type: "function", stateMutability: "nonpayable", inputs: [{ name: "amount", type: "uint256" }], outputs: [] },
+  { name: "borrow", type: "function", stateMutability: "nonpayable", inputs: [{ name: "amount", type: "uint256" }], outputs: [] },
+  { name: "forceCheck", type: "function", stateMutability: "nonpayable", inputs: [], outputs: [] },
+] as const;
+
+const breakerWriteAbi = [
+  { name: "unpause", type: "function", stateMutability: "nonpayable", inputs: [], outputs: [] },
+] as const;
+
+const baseChain = defineChain({ id: 84532, name: "Base Sepolia", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [chains[0].rpcUrl] } } });
+const unichain = defineChain({ id: 1301, name: "Unichain Sepolia", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [chains[2].rpcUrl] } } });
+
 const clients = Object.fromEntries(
   chains.map((chain) => [
     chain.key,
@@ -168,6 +186,14 @@ function App() {
   const [data, setData] = useState<DashboardData>();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [walletAddress, setWalletAddress] = useState<Address>();
+  const [walletChainId, setWalletChainId] = useState<number>();
+  const [actionAmount, setActionAmount] = useState("0.001");
+  const [actionStatus, setActionStatus] = useState("Connect a wallet to run the live demo.");
+  const [actionBusy, setActionBusy] = useState(false);
+  const [lastTx, setLastTx] = useState<{ hash: Hash; chain: ChainConfig }>();
+  const [demoPhase, setDemoPhase] = useState<"idle" | "preparing" | "breach" | "reacting" | "complete">("idle");
+  const [reactionSeconds, setReactionSeconds] = useState<number>();
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -187,6 +213,158 @@ function App() {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
+  const connectWallet = useCallback(async () => {
+    if (!window.ethereum) {
+      setActionStatus("Install MetaMask or another injected wallet to run the simulation.");
+      return;
+    }
+    try {
+      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" }) as string[];
+      const chainHex = await window.ethereum.request({ method: "eth_chainId" }) as string;
+      setWalletAddress(accounts[0] as Address);
+      setWalletChainId(Number.parseInt(chainHex, 16));
+      setActionStatus("Wallet connected. Choose a demo action.");
+    } catch (reason) {
+      setActionStatus(reason instanceof Error ? reason.message : "Wallet connection was rejected.");
+    }
+  }, []);
+
+  const ensureWalletChain = useCallback(async (chain: ChainConfig) => {
+    if (!window.ethereum || !walletAddress) throw new Error("Connect your wallet first.");
+    if (walletChainId === chain.chainId) return;
+    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: `0x${chain.chainId.toString(16)}` }] });
+    setWalletChainId(chain.chainId);
+  }, [walletAddress, walletChainId]);
+
+  const runAction = useCallback(async (name: "deposit" | "recordLoss" | "borrow" | "forceCheck" | "unpause") => {
+    if (!window.ethereum || !walletAddress) {
+      setActionStatus("Connect your wallet before running a demo action.");
+      return;
+    }
+    const targetChain = name === "unpause" ? chains[2] : chains[0];
+    setActionBusy(true);
+    setLastTx(undefined);
+    try {
+      await ensureWalletChain(targetChain);
+      const wallet = createWalletClient({ account: walletAddress, chain: name === "unpause" ? unichain : baseChain, transport: custom(window.ethereum) });
+      const amount = parseEther(actionAmount || "0");
+      let hash: Hash;
+      if (name === "deposit") {
+        if (amount === 0n) throw new Error("Enter an ETH amount greater than zero.");
+        hash = await wallet.writeContract({ address: addresses.vault, abi: vaultWriteAbi, functionName: "deposit", value: amount });
+      } else if (name === "recordLoss") {
+        if (amount === 0n) throw new Error("Enter a loss amount greater than zero.");
+        hash = await wallet.writeContract({ address: addresses.vault, abi: vaultWriteAbi, functionName: "recordLoss", args: [amount] });
+      } else if (name === "borrow") {
+        if (amount === 0n) throw new Error("Enter a borrow amount greater than zero.");
+        hash = await wallet.writeContract({ address: addresses.vault, abi: vaultWriteAbi, functionName: "borrow", args: [amount] });
+      } else if (name === "forceCheck") {
+        hash = await wallet.writeContract({ address: addresses.vault, abi: vaultWriteAbi, functionName: "forceCheck" });
+      } else {
+        hash = await wallet.writeContract({ address: addresses.breaker, abi: breakerWriteAbi, functionName: "unpause" });
+      }
+      setLastTx({ hash, chain: targetChain });
+      setActionStatus(`${name === "unpause" ? "Recovery" : "Simulation"} transaction submitted. Waiting for the network…`);
+      await clients[targetChain.key].waitForTransactionReceipt({ hash });
+      setActionStatus(`${name === "unpause" ? "Breaker unpaused." : "Transaction confirmed."} Waiting for Reactive propagation.`);
+      await refresh();
+    } catch (reason) {
+      setActionStatus(reason instanceof Error ? reason.message : "Transaction failed or was rejected.");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [actionAmount, ensureWalletChain, refresh, walletAddress]);
+
+  const runLiveDemo = useCallback(async () => {
+    if (!window.ethereum || !walletAddress) {
+      setActionStatus("Connect your wallet before running the live demo.");
+      return;
+    }
+    setActionBusy(true);
+    setLastTx(undefined);
+    setReactionSeconds(undefined);
+    setDemoPhase("preparing");
+    try {
+    const requestedSeed = parseEther(actionAmount || "0.01");
+    if (requestedSeed === 0n) throw new Error("Enter a seed amount greater than zero.");
+
+    setActionStatus("Step 1/3 · Resetting the destination breaker…");
+    await ensureWalletChain(chains[2]);
+    const uniWallet = createWalletClient({ account: walletAddress, chain: unichain, transport: custom(window.ethereum) });
+      const isPaused = await clients.unichain.readContract({ address: addresses.breaker, abi: breakerAbi, functionName: "paused" });
+      if (isPaused) {
+        const resetHash = await uniWallet.writeContract({ address: addresses.breaker, abi: breakerWriteAbi, functionName: "unpause" });
+        await clients.unichain.waitForTransactionReceipt({ hash: resetHash });
+      }
+
+      setActionStatus("Step 2/3 · Restoring origin coverage with a deposit…");
+      await ensureWalletChain(chains[0]);
+      const baseWallet = createWalletClient({ account: walletAddress, chain: baseChain, transport: custom(window.ethereum) });
+      const [currentReserves, currentLiabilities, threshold, initialGuardCount] = await Promise.all([
+        clients.base.readContract({ address: addresses.vault, abi: vaultAbi, functionName: "reserves" }),
+        clients.base.readContract({ address: addresses.vault, abi: vaultAbi, functionName: "totalDeposits" }),
+        clients.base.readContract({ address: addresses.vault, abi: vaultAbi, functionName: "minCoverageBps" }),
+        clients.lasna.readContract({ address: addresses.guard, abi: guardAbi, functionName: "breachCount" }),
+      ]);
+      const restoreNumerator = threshold * currentLiabilities > 10_000n * currentReserves
+        ? threshold * currentLiabilities - 10_000n * currentReserves
+        : 0n;
+      const restoreDenominator = 10_000n - threshold;
+      const requiredRestore = restoreNumerator === 0n || restoreDenominator === 0n
+        ? 0n
+        : (restoreNumerator + restoreDenominator - 1n) / restoreDenominator + 1n;
+      const seedAmount = requestedSeed > requiredRestore ? requestedSeed : requiredRestore;
+      const depositHash = await baseWallet.writeContract({ address: addresses.vault, abi: vaultWriteAbi, functionName: "deposit", value: seedAmount });
+      setLastTx({ hash: depositHash, chain: chains[0] });
+      await clients.base.waitForTransactionReceipt({ hash: depositHash });
+      await refresh();
+
+      setActionStatus("Step 3/3 · Sending the breach transaction…");
+      setDemoPhase("breach");
+      const [postDepositReserves, postDepositLiabilities] = await Promise.all([
+        clients.base.readContract({ address: addresses.vault, abi: vaultAbi, functionName: "reserves" }),
+        clients.base.readContract({ address: addresses.vault, abi: vaultAbi, functionName: "totalDeposits" }),
+      ]);
+      const breachNumerator = 10_000n * postDepositReserves > threshold * postDepositLiabilities
+        ? 10_000n * postDepositReserves - threshold * postDepositLiabilities
+        : 0n;
+      const minimumLoss = breachNumerator === 0n ? 1n : breachNumerator / 10_000n + 1n;
+      const lossAmount = (seedAmount * 6n) / 10n > minimumLoss ? (seedAmount * 6n) / 10n : minimumLoss;
+      if (lossAmount >= postDepositReserves) throw new Error("Seed amount is too small to create a breach with the available reserves.");
+      const breachSubmittedAt = performance.now();
+      const breachHash = await baseWallet.writeContract({ address: addresses.vault, abi: vaultWriteAbi, functionName: "recordLoss", args: [lossAmount] });
+      setLastTx({ hash: breachHash, chain: chains[0] });
+      await clients.base.waitForTransactionReceipt({ hash: breachHash });
+      setDemoPhase("reacting");
+      setActionStatus("Origin breach confirmed. Reactive is watching the event…");
+      const started = performance.now();
+      for (let attempt = 0; attempt < 45; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+        const [guardCount, paused] = await Promise.all([
+          clients.lasna.readContract({ address: addresses.guard, abi: guardAbi, functionName: "breachCount" }),
+          clients.unichain.readContract({ address: addresses.breaker, abi: breakerAbi, functionName: "paused" }),
+        ]);
+        if (paused && guardCount > initialGuardCount) {
+          const elapsed = (performance.now() - started) / 1000;
+          setReactionSeconds(Number(elapsed.toFixed(1)));
+          setDemoPhase("complete");
+          setActionStatus(`Reactive delivered the callback and paused Unichain in ${elapsed.toFixed(1)}s.`);
+          await refresh();
+          setActionBusy(false);
+          return;
+        }
+        setActionStatus(`Reactive is watching… ${Math.floor((performance.now() - breachSubmittedAt) / 1000)}s since breach submission`);
+      }
+      setActionStatus("Breach confirmed, but the callback has not arrived yet. Keep watching the live dashboard.");
+      await refresh();
+    } catch (reason) {
+      setDemoPhase("idle");
+      setActionStatus(reason instanceof Error ? reason.message : "The live demo transaction was rejected.");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [actionAmount, ensureWalletChain, refresh, walletAddress]);
+
   const healthRatio = data ? Math.min(Number(data.vault.health) / Number(data.vault.threshold), 1) : 0;
   const incident = data?.breaker.paused ?? false;
   const timeline = useMemo(() => [
@@ -201,7 +379,7 @@ function App() {
       <div className="ambient ambient-two" />
       <nav className="topbar">
         <div className="brand"><span className="brand-mark"><Icon name="shield" /></span><span>AEGIS<span className="brand-dot">.</span></span><small>COMMAND CENTER</small></div>
-        <div className="topbar-actions"><span className="live-pill"><i /> LIVE MONITORING</span><button className="refresh-button" onClick={() => void refresh()} disabled={loading}><Icon name="refresh" /> {loading ? "SYNCING" : "REFRESH"}</button></div>
+        <div className="topbar-actions"><span className="live-pill"><i /> LIVE MONITORING</span><button className="refresh-button" onClick={() => void refresh()} disabled={loading}><Icon name="refresh" /> {loading ? "SYNCING" : "REFRESH"}</button><button className="wallet-button" onClick={() => void connectWallet()}>{walletAddress ? `${shortAddress(walletAddress)} · ${walletChainId === 84532 ? "BASE" : walletChainId === 1301 ? "UNI" : "SWITCH"}` : "CONNECT WALLET"}</button></div>
       </nav>
 
       <section className="hero">
@@ -257,6 +435,14 @@ function App() {
           <div className="snapshot-grid"><div><span>Frozen LTV</span><strong>{data ? percentage(data.breaker.frozenLtv) : "—"}</strong></div><div><span>Incidents</span><strong>{data ? formatNumber(data.breaker.breachCount) : "—"}</strong></div><div><span>Paused since</span><strong>{data ? formatDate(data.breaker.pausedAt) : "—"}</strong></div><div><span>Last breach</span><strong className="mono">{data ? shortHash(data.breaker.lastBreachId) : "—"}</strong></div></div>
           <div className="protection-note"><Icon name="shield" /><div><strong>{incident ? "Protection is holding" : "Protection is armed"}</strong><p>{incident ? "All destination-side credit and redemption paths are frozen until an owner reviews the incident." : "The breaker is ready to contain a verified breach."}</p></div></div>
         </article>
+      </section>
+
+      <section className="demo-console">
+        <div className="console-heading"><div><p className="eyebrow">ONE-CLICK LIVE DEMO</p><h2>Watch Reactive move.</h2><p>One button resets the incident, seeds the vault, triggers a real breach, and measures the callback to Unichain.</p></div><div className="wallet-state">{walletAddress ? <><span className="wallet-dot" /> {shortAddress(walletAddress)}<small>Chain {walletChainId ?? "—"}</small></> : <><span className="wallet-dot offline" /> Wallet not connected</>}</div></div>
+        <div className="demo-controls single-demo"><label className="amount-field"><span>SEED · ETH</span><input value={actionAmount} onChange={(event) => setActionAmount(event.target.value)} inputMode="decimal" placeholder="0.01" /></label><button className="run-demo-button" onClick={() => void runLiveDemo()} disabled={actionBusy || !walletAddress}><span className="run-icon">{actionBusy ? "…" : "▶"}</span><span><strong>{actionBusy ? "RUNNING LIVE DEMO" : "RUN LIVE DEMO"}</strong><small>Reset · breach · Reactive callback · pause</small></span><Icon name="arrow" /></button></div>
+        <div className="demo-steps"><div className={demoPhase === "preparing" ? "demo-step active" : demoPhase !== "idle" ? "demo-step done" : "demo-step"}><b>01</b><span>Prepare</span><small>Reset + seed</small></div><div className={demoPhase === "breach" ? "demo-step active" : ["reacting", "complete"].includes(demoPhase) ? "demo-step done" : "demo-step"}><b>02</b><span>Origin breach</span><small>Base Sepolia</small></div><div className={demoPhase === "reacting" ? "demo-step active reactive-step" : demoPhase === "complete" ? "demo-step done reactive-step" : "demo-step reactive-step"}><b>03</b><span>Reactive</span><small>Lasna callback</small></div><div className={demoPhase === "complete" ? "demo-step done" : "demo-step"}><b>04</b><span>Breaker pause</span><small>Unichain</small></div>{reactionSeconds !== undefined && <strong className="reaction-result">{reactionSeconds}s <small>reaction</small></strong>}</div>
+        <div className="action-status"><span className={actionBusy ? "status-spinner" : "status-check"}>{actionBusy ? "…" : "✓"}</span><span>{actionStatus}</span>{lastTx && <a href={`${lastTx.chain.explorer}/tx/${lastTx.hash}`} target="_blank" rel="noreferrer">View transaction ↗</a>}</div>
+        <div className="console-disclaimer">Real testnet sequence. Your wallet signs every transaction; no private key is stored or sent to the frontend.</div>
       </section>
 
       <section className="network-section"><div className="section-heading"><div><p className="eyebrow">NETWORKS</p><h2>Three chains. One invariant.</h2></div><span className="last-updated">{data ? `Last synced ${data.fetchedAt.toLocaleTimeString()}` : "Connecting…"}</span></div><div className="network-grid">{chains.map((chain) => <a className="network-card" href={explorerAddress(chain, chain.key === "base" ? addresses.vault : chain.key === "lasna" ? addresses.guard : addresses.breaker)} target="_blank" rel="noreferrer" key={chain.key}><div className="network-top"><span className="network-pulse" style={{ background: chain.accent, boxShadow: `0 0 12px ${chain.accent}` }} /><span>{chain.label}</span><Icon name="external" /></div><strong>{chain.name}</strong><div className="network-bottom"><span>Chain ID <b>{chain.chainId.toLocaleString()}</b></span><span>Block <b>{data ? formatNumber(data.blocks[chain.key]) : "—"}</b></span></div></a>)}</div></section>

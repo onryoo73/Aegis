@@ -397,21 +397,17 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. In a second terminal, load the repository environment and use
-the existing scripts to produce the live incident:
+Open `http://localhost:5173`, connect the owner/operator wallet, enter a seed amount such as
+`0.01`, and click **RUN LIVE DEMO**. The browser asks the wallet to approve a short sequence:
 
-```powershell
-# From the repository root
-forge script script/SeedDemo.s.sol:SeedDemo `
-  --rpc-url $env:BASE_SEPOLIA_RPC_URL `
-  --private-key $env:PRIVATE_KEY `
-  --broadcast
+1. Reset the destination breaker if it is already paused.
+2. Deposit ETH to restore origin coverage.
+3. Record an owner-authorized loss to cross below the threshold.
+4. Poll Reactive Lasna until the callback arrives.
+5. Show the measured time until Unichain pauses.
 
-forge script script/SimulateBreach.s.sol:SimulateBreach `
-  --rpc-url $env:BASE_SEPOLIA_RPC_URL `
-  --private-key $env:PRIVATE_KEY `
-  --broadcast
-```
+The UI makes the Reactive step explicit and displays the elapsed callback time. All
+transactions are signed by the connected wallet.
 
 The dashboard refreshes every 15 seconds. The expected story is:
 
