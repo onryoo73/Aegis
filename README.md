@@ -371,6 +371,59 @@ More detail, including failure-mode analysis, is in [`docs/ARCHITECTURE.md`](doc
 - [`reactive-lib-omni`](https://github.com/Reactive-Network/reactive-lib-omni) — official Omni API
 - OpenZeppelin Contracts v5 (`Ownable2Step`, `ReentrancyGuard`)
 
+## Frontend dashboard
+
+The read-only Aegis Command Center lives in [`frontend/`](frontend/). It reads the deployed
+vault, reactive guard, and destination breaker directly from their public RPC endpoints.
+
+```bash
+cd frontend
+npm install
+copy .env.example .env
+# Set the VITE_* addresses/RPC URLs in .env
+npm run dev
+```
+
+The dashboard never requests a private key or signs transactions. It is an operational view
+for coverage, callback counts, breaker state, chain health, and the breach-to-pause pipeline.
+
+### Showcase flow
+
+Run the dashboard in one terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. In a second terminal, load the repository environment and use
+the existing scripts to produce the live incident:
+
+```powershell
+# From the repository root
+forge script script/SeedDemo.s.sol:SeedDemo `
+  --rpc-url $env:BASE_SEPOLIA_RPC_URL `
+  --private-key $env:PRIVATE_KEY `
+  --broadcast
+
+forge script script/SimulateBreach.s.sol:SimulateBreach `
+  --rpc-url $env:BASE_SEPOLIA_RPC_URL `
+  --private-key $env:PRIVATE_KEY `
+  --broadcast
+```
+
+The dashboard refreshes every 15 seconds. The expected story is:
+
+1. Origin coverage drops below the configured 80% threshold.
+2. The Reactive guard confirms the breach and requests a callback.
+3. The Unichain breaker changes to `PAUSED` and freezes the LTV snapshot.
+4. The dashboard shows the incident count, breach ID, and chain block progression.
+
+To reset the destination breaker after the presentation, call `unpause()` from the owner
+account using `cast send`. The dashboard is intentionally read-only; it cannot broadcast
+transactions or expose a private key.
+
 ## License
 
 MIT
